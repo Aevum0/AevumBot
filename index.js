@@ -422,6 +422,7 @@ client.on('interactionCreate', async (interaction) => {
 
     try {
       await interaction.member.roles.add(role);
+      await interaction.member.roles.remove(AUTO_ROLE_ID).catch(() => {});
       await interaction.reply({ content: 'Member role successfully assigned. Enjoy the server.', ephemeral: true });
     } catch (err) {
       console.error('[GetMember] Error:', err);
