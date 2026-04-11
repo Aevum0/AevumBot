@@ -18,6 +18,7 @@ const SHELP_ROLE_ID   = '1492332555985486108';
 
 // Ticket config
 const SUPPORT_CATEGORY_ID  = '1492510610351587388';
+const PURCHASE_CATEGORY_ID = '1492510746360152244';
 const SUPPORT_STAFF_ROLE   = '1491479203869098056';
 const TICKET_LOG_CHANNEL   = '1492511561158365256';
 
@@ -295,7 +296,7 @@ client.on('messageCreate', async (message) => {
       .addFields(
         { name: 'Moderation', value: '`!ban @user [reason]`\n`!unban <id>`\n`!kick @user [reason]`\n`!timeout @user <10s/5m/1h/1d> [reason]`\n`!del <1-100>`' },
         { name: 'Info', value: '`!whois [@user]`\n`!ping`' },
-        { name: 'Utility', value: '`!say #channel <message>`\n`!getmember`\n`!joins`\n`!support`' },
+        { name: 'Utility', value: '`!say #channel <message>`\n`!getmember`\n`!joins`\n`!support`\n`!purchase`' },
         { name: 'Staff Only', value: '`.shelp`' },
       )
       .setFooter({ text: 'AevumDevs Staff Panel' })
@@ -329,9 +330,34 @@ client.on('messageCreate', async (message) => {
     await message.delete().catch(() => {});
   }
 
+  // ── !purchase ──────────────────────────────────────────────────────────────
+  if (command === '!purchase') {
+    if (!message.member.permissions.has(PermissionFlagsBits.ManageChannels))
+      return message.reply('You do not have permission to use this command.');
+
+    const embed = new EmbedBuilder()
+      .setColor(0x5865F2)
+      .setTitle('AevumDevs | Purchase Ticket')
+      .setDescription(
+        'If you want to make a purchase, you can open a Purchase Ticket.\n\n' +
+        '• Only staff and you can see the ticket.\n' +
+        '• Provide as much detail as possible.\n' +
+        '• Close the ticket when you are done.'
+      )
+      .setImage('https://cdn.discordapp.com/attachments/1492511561158365256/1492520168616759346/PurchaseTicket.gif?ex=69dba139&is=69da4fb9&hm=ae25fbb2d8b5c3da07d2f9c67bea9ed9a6b16e2f06d4f3feb7530cd4134e94dd&')
+      .setTimestamp();
+
+    const row = new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId('open_purchase').setLabel('Purchase Ticket').setStyle(ButtonStyle.Success)
+    );
+
+    await message.channel.send({ embeds: [embed], components: [row] });
+    await message.delete().catch(() => {});
+  }
+
   // ── !close (ticket kanalında) ──────────────────────────────────────────────
   if (command === '!close') {
-    if (!message.channel.name.startsWith('support-')) return;
+    if (!message.channel.name.startsWith('support-') && !message.channel.name.startsWith('purchase-')) return;
 
     const hasPermission =
       message.member.permissions.has(PermissionFlagsBits.ManageChannels) ||
@@ -451,6 +477,49 @@ client.on('interactionCreate', async (interaction) => {
       await interaction.editReply({ content: `Your ticket has been created: <#${ticketChannel.id}>` });
     } catch (err) {
       console.error('[OpenSupport] Error:', err);
+      await interaction.editReply({ content: 'Failed to create ticket. Contact an administrator.' });
+    }
+  }
+
+  // ── open_purchase ──────────────────────────────────────────────────────────
+  if (interaction.customId === 'open_purchase') {
+    await interaction.deferReply({ ephemeral: true });
+
+    ticketCounter++;
+    const channelName = `purchase-${interaction.user.username}-${ticketCounter}`;
+
+    try {
+      const ticketChannel = await interaction.guild.channels.create({
+        name: channelName,
+        type: ChannelType.GuildText,
+        parent: PURCHASE_CATEGORY_ID,
+        permissionOverwrites: [
+          { id: interaction.guild.id, deny: [PermissionFlagsBits.ViewChannel] },
+          { id: interaction.user.id, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory] },
+          { id: SUPPORT_STAFF_ROLE, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory] },
+        ],
+      });
+
+      const embed = new EmbedBuilder()
+        .setColor(0x57F287)
+        .setTitle('Purchase')
+        .setDescription(`${interaction.user.username}\n\nA staff member will be with you shortly.`)
+        .setThumbnail(interaction.user.displayAvatarURL({ dynamic: true, size: 128 }))
+        .setFooter({ text: `AevumDevs • ${new Date().toLocaleString('en-US', { month: 'numeric', day: 'numeric', year: 'numeric', hour: '2-digit', minute: '2-digit' })}` });
+
+      const row = new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId('close_ticket').setLabel('Close').setStyle(ButtonStyle.Danger)
+      );
+
+      await ticketChannel.send({
+        content: `<@${interaction.user.id}> <@&${SUPPORT_STAFF_ROLE}>`,
+        embeds: [embed],
+        components: [row],
+      });
+
+      await interaction.editReply({ content: `Your ticket has been created: <#${ticketChannel.id}>` });
+    } catch (err) {
+      console.error('[OpenPurchase] Error:', err);
       await interaction.editReply({ content: 'Failed to create ticket. Contact an administrator.' });
     }
   }
