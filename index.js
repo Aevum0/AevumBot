@@ -1,4 +1,4 @@
-const { Client, GatewayIntentBits, Partials, EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, PermissionFlagsBits } = require('discord.js');
+const { Client, GatewayIntentBits, Partials, EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, PermissionFlagsBits, ChannelType, AttachmentBuilder } = require('discord.js');
 
 const client = new Client({
   intents: [
@@ -16,7 +16,13 @@ const BOT_TOKEN       = process.env.BOT_TOKEN;
 const LOG_CHANNEL_ID  = '1492333026594521158';
 const SHELP_ROLE_ID   = '1492332555985486108';
 
+// Ticket config
+const SUPPORT_CATEGORY_ID  = '1492510610351587388';
+const SUPPORT_STAFF_ROLE   = '1491479203869098056';
+const TICKET_LOG_CHANNEL   = '1492511561158365256';
+
 let joinLogChannelId = process.env.JOIN_LOG_CHANNEL_ID || '';
+let ticketCounter = 0;
 
 // ─── HELPERS ──────────────────────────────────────────────────────────────────
 async function sendLog(guild, embed) {
@@ -183,7 +189,6 @@ client.on('messageCreate', async (message) => {
   }
 
   // ── !timeout @ [time] [reason] ─────────────────────────────────────────────
-  // time format: 10s, 5m, 1h, 1d
   if (command === '!timeout') {
     if (!message.member.permissions.has(PermissionFlagsBits.ModerateMembers))
       return message.reply('You do not have permission to use this command.');
@@ -212,7 +217,7 @@ client.on('messageCreate', async (message) => {
         { name: 'Duration', value: timeStr, inline: true },
         { name: 'Reason', value: reason },
       ]));
-    } catch (err) {
+    } catch {
       message.reply('Failed to timeout this user.');
     }
   }
@@ -290,7 +295,7 @@ client.on('messageCreate', async (message) => {
       .addFields(
         { name: 'Moderation', value: '`!ban @user [reason]`\n`!unban <id>`\n`!kick @user [reason]`\n`!timeout @user <10s/5m/1h/1d> [reason]`\n`!del <1-100>`' },
         { name: 'Info', value: '`!whois [@user]`\n`!ping`' },
-        { name: 'Utility', value: '`!say #channel <message>`\n`!getmember`\n`!joins`' },
+        { name: 'Utility', value: '`!say #channel <message>`\n`!getmember`\n`!joins`\n`!support`' },
         { name: 'Staff Only', value: '`.shelp`' },
       )
       .setFooter({ text: 'AevumDevs Staff Panel' })
@@ -298,12 +303,89 @@ client.on('messageCreate', async (message) => {
 
     message.reply({ embeds: [embed] });
   }
+
+  // ── !support ───────────────────────────────────────────────────────────────
+  if (command === '!support') {
+    if (!message.member.permissions.has(PermissionFlagsBits.ManageChannels))
+      return message.reply('You do not have permission to use this command.');
+
+    const embed = new EmbedBuilder()
+      .setColor(0x5865F2)
+      .setTitle('AevumDevs | Support Ticket')
+      .setDescription(
+        'If you have any problems, you can open a Support Ticket.\n\n' +
+        '• Only staff and you can see the ticket.\n' +
+        '• Provide as much detail as possible.\n' +
+        '• Close the ticket when you are done.'
+      )
+      .setImage('https://i.imgur.com/placeholder_support.png')
+      .setTimestamp();
+
+    const row = new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId('open_support').setLabel('Support Ticket').setStyle(ButtonStyle.Primary)
+    );
+
+    await message.channel.send({ embeds: [embed], components: [row] });
+    await message.delete().catch(() => {});
+  }
+
+  // ── !close (ticket kanalında) ──────────────────────────────────────────────
+  if (command === '!close') {
+    if (!message.channel.name.startsWith('support-')) return;
+
+    const hasPermission =
+      message.member.permissions.has(PermissionFlagsBits.ManageChannels) ||
+      message.member.roles.cache.has(SUPPORT_STAFF_ROLE);
+
+    if (!hasPermission) return message.reply('You do not have permission to close this ticket.');
+
+    await closeTicket(message.channel, message.guild, message.author);
+  }
 });
 
-// ─── BUTTON: get_member ───────────────────────────────────────────────────────
+// ─── CLOSE TICKET FUNCTION ────────────────────────────────────────────────────
+async function closeTicket(channel, guild, closedBy) {
+  try {
+    const messages = await channel.messages.fetch({ limit: 100 });
+    const sorted = [...messages.values()].reverse();
+
+    let transcript = `Ticket: ${channel.name}\nClosed by: ${closedBy.tag}\nDate: ${new Date().toISOString()}\n\n`;
+    transcript += '─'.repeat(50) + '\n\n';
+
+    for (const msg of sorted) {
+      const time = new Date(msg.createdTimestamp).toLocaleString('en-US');
+      transcript += `[${time}] ${msg.author.tag}: ${msg.content || '[embed/attachment]'}\n`;
+    }
+
+    const buffer = Buffer.from(transcript, 'utf-8');
+    const attachment = new AttachmentBuilder(buffer, { name: `${channel.name}.txt` });
+
+    const logChannel = guild.channels.cache.get(TICKET_LOG_CHANNEL);
+    if (logChannel) {
+      const logEmbed = new EmbedBuilder()
+        .setColor(0xED4245)
+        .setTitle('Ticket Closed')
+        .addFields(
+          { name: 'Ticket', value: channel.name, inline: true },
+          { name: 'Closed By', value: closedBy.tag, inline: true },
+        )
+        .setTimestamp();
+
+      await logChannel.send({ embeds: [logEmbed], files: [attachment] });
+    }
+
+    await channel.send('Ticket is being closed...');
+    setTimeout(() => channel.delete().catch(() => {}), 3000);
+  } catch (err) {
+    console.error('[CloseTicket] Error:', err);
+  }
+}
+
+// ─── BUTTONS ──────────────────────────────────────────────────────────────────
 client.on('interactionCreate', async (interaction) => {
   if (!interaction.isButton()) return;
 
+  // ── get_member ─────────────────────────────────────────────────────────────
   if (interaction.customId === 'get_member') {
     const role = interaction.guild.roles.cache.get(MEMBER_ROLE_ID);
     if (!role)
@@ -319,6 +401,71 @@ client.on('interactionCreate', async (interaction) => {
       console.error('[GetMember] Error:', err);
       await interaction.reply({ content: 'Failed to assign role. Contact an administrator.', ephemeral: true });
     }
+  }
+
+  // ── open_support ───────────────────────────────────────────────────────────
+  if (interaction.customId === 'open_support') {
+    await interaction.deferReply({ ephemeral: true });
+
+    ticketCounter++;
+    const channelName = `support-${interaction.user.username}-${ticketCounter}`;
+
+    try {
+      const ticketChannel = await interaction.guild.channels.create({
+        name: channelName,
+        type: ChannelType.GuildText,
+        parent: SUPPORT_CATEGORY_ID,
+        permissionOverwrites: [
+          {
+            id: interaction.guild.id,
+            deny: [PermissionFlagsBits.ViewChannel],
+          },
+          {
+            id: interaction.user.id,
+            allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory],
+          },
+          {
+            id: SUPPORT_STAFF_ROLE,
+            allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory],
+          },
+        ],
+      });
+
+      const embed = new EmbedBuilder()
+        .setColor(0x5865F2)
+        .setTitle('Support')
+        .setDescription(`${interaction.user.username}\n\nA staff member will be with you shortly.`)
+        .setThumbnail(interaction.user.displayAvatarURL({ dynamic: true, size: 128 }))
+        .setFooter({ text: `AevumDevs • ${new Date().toLocaleString('en-US', { month: 'numeric', day: 'numeric', year: 'numeric', hour: '2-digit', minute: '2-digit' })}` });
+
+      const row = new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId('close_ticket').setLabel('Close').setStyle(ButtonStyle.Danger)
+      );
+
+      await ticketChannel.send({
+        content: `<@${interaction.user.id}> <@&${SUPPORT_STAFF_ROLE}>`,
+        embeds: [embed],
+        components: [row],
+      });
+
+      await interaction.editReply({ content: `Your ticket has been created: <#${ticketChannel.id}>` });
+    } catch (err) {
+      console.error('[OpenSupport] Error:', err);
+      await interaction.editReply({ content: 'Failed to create ticket. Contact an administrator.' });
+    }
+  }
+
+  // ── close_ticket (button) ──────────────────────────────────────────────────
+  if (interaction.customId === 'close_ticket') {
+    const hasPermission =
+      interaction.member.permissions.has(PermissionFlagsBits.ManageChannels) ||
+      interaction.member.roles.cache.has(SUPPORT_STAFF_ROLE);
+
+    if (!hasPermission)
+      return interaction.reply({ content: 'You do not have permission to close this ticket.', ephemeral: true });
+
+    await interaction.reply({ content: 'Closing ticket...', ephemeral: true });
+    await closeTicket(interaction.channel, interaction.guild, interaction.user);
   }
 });
 
