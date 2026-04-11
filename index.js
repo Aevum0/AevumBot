@@ -318,7 +318,7 @@ client.on('messageCreate', async (message) => {
         '• Provide as much detail as possible.\n' +
         '• Close the ticket when you are done.'
       )
-      .setImage('https://i.imgur.com/placeholder_support.png')
+      .setImage('https://cdn.discordapp.com/attachments/1492511561158365256/1492517573445812345/SupportTicket.gif?ex=69db9ecf&is=69da4d4f&hm=0cd856e9260e64cb9052fc821ce18ab006ce602a0677e54b21b354b56f4974ec&')
       .setTimestamp();
 
     const row = new ActionRowBuilder().addComponents(
