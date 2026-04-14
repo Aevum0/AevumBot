@@ -1,4 +1,8 @@
-const { Client, GatewayIntentBits, Partials, EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, PermissionFlagsBits, ChannelType, AttachmentBuilder } = require('discord.js');
+const {
+  Client, GatewayIntentBits, Partials, EmbedBuilder,
+  ActionRowBuilder, ButtonBuilder, ButtonStyle, PermissionFlagsBits
+} = require('discord.js');
+const https = require('https');
 
 const client = new Client({
   intents: [
@@ -6,44 +10,138 @@ const client = new Client({
     GatewayIntentBits.GuildMembers,
     GatewayIntentBits.GuildMessages,
     GatewayIntentBits.MessageContent,
+    GatewayIntentBits.DirectMessages,
   ],
-  partials: [Partials.GuildMember],
+  partials: [Partials.GuildMember, Partials.Channel],
 });
 
-const AUTO_ROLE_ID    = process.env.AUTO_ROLE_ID;
-const MEMBER_ROLE_ID  = process.env.MEMBER_ROLE_ID;
-const BOT_TOKEN       = process.env.BOT_TOKEN;
-const LOG_CHANNEL_ID  = '1492333026594521158';
-const SHELP_ROLE_ID   = '1492332555985486108';
+const AUTO_ROLE_ID   = process.env.AUTO_ROLE_ID;
+const MEMBER_ROLE_ID = process.env.MEMBER_ROLE_ID;
+const BOT_TOKEN      = process.env.BOT_TOKEN;
+const GITHUB_TOKEN   = process.env.GITHUB_TOKEN;
+const GITHUB_REPO    = process.env.GITHUB_REPO;   // Aevum0/AevumDevsKeySystem
+const GITHUB_FILE    = process.env.GITHUB_FILE_PATH; // UniversalKeySystem.txt
 
-// Ticket config
-const SUPPORT_CATEGORY_ID  = '1492510610351587388';
-const PURCHASE_CATEGORY_ID = '1492510746360152244';
-const SUPPORT_STAFF_ROLE   = '1491479203869098056';
-const TICKET_LOG_CHANNEL   = '1492511561158365256';
+const KEY_ROLE_IDS   = ['1491479203869098056', '1491478838390034635'];
+const KEY_DURATION_MS = 10 * 60 * 60 * 1000; // 10 saat
+const MAX_KEYS_PER_USER = 10;
 
 let joinLogChannelId = process.env.JOIN_LOG_CHANNEL_ID || '';
-let ticketCounter = 0;
 
-// ─── HELPERS ──────────────────────────────────────────────────────────────────
-async function sendLog(guild, embed) {
-  const ch = guild.channels.cache.get(LOG_CHANNEL_ID);
-  if (ch) ch.send({ embeds: [embed] });
+// userId -> [{ key, expiresAt, notified }]
+const userKeys = new Map();
+
+// ─── KEY HELPERS ──────────────────────────────────────────────────────────────
+function generateKey() {
+  const rand = Math.floor(Math.random() * 1e20).toString().padStart(20, '0');
+  return `AEVD-Free-10h-${rand}`;
 }
 
-function modEmbed(color, title, fields) {
-  return new EmbedBuilder()
-    .setColor(color)
-    .setTitle(title)
-    .addFields(fields)
-    .setTimestamp();
+function getUserKeys(userId) {
+  if (!userKeys.has(userId)) userKeys.set(userId, []);
+  return userKeys.get(userId);
 }
+
+function getActiveKeys(userId) {
+  const now = Date.now();
+  return getUserKeys(userId).filter(k => k.expiresAt > now);
+}
+
+// ─── GITHUB ───────────────────────────────────────────────────────────────────
+async function githubRequest(method, path, body) {
+  return new Promise((resolve, reject) => {
+    const data = body ? JSON.stringify(body) : null;
+    const req = https.request({
+      hostname: 'api.github.com',
+      path,
+      method,
+      headers: {
+        'Authorization': `token ${GITHUB_TOKEN}`,
+        'User-Agent': 'AevumBot',
+        'Content-Type': 'application/json',
+        ...(data ? { 'Content-Length': Buffer.byteLength(data) } : {}),
+      },
+    }, res => {
+      let raw = '';
+      res.on('data', c => raw += c);
+      res.on('end', () => {
+        try { resolve(JSON.parse(raw)); } catch { resolve(raw); }
+      });
+    });
+    req.on('error', reject);
+    if (data) req.write(data);
+    req.end();
+  });
+}
+
+async function getFileSha() {
+  const res = await githubRequest('GET', `/repos/${GITHUB_REPO}/contents/${GITHUB_FILE}`);
+  return { sha: res.sha, content: res.content };
+}
+
+async function pushKeysToGitHub(keys) {
+  let sha;
+  try {
+    const file = await getFileSha();
+    sha = file.sha;
+  } catch {}
+
+  const content = Buffer.from(keys.join('\n') + '\n').toString('base64');
+  await githubRequest('PUT', `/repos/${GITHUB_REPO}/contents/${GITHUB_FILE}`, {
+    message: 'AevumBot: key update',
+    content,
+    ...(sha ? { sha } : {}),
+  });
+}
+
+async function getAllActiveKeysFromMemory() {
+  const now = Date.now();
+  const all = [];
+  for (const keys of userKeys.values()) {
+    for (const k of keys) {
+      if (k.expiresAt > now) all.push(k.key);
+    }
+  }
+  return all;
+}
+
+async function addKeyToGitHub(newKey) {
+  const activeKeys = await getAllActiveKeysFromMemory();
+  await pushKeysToGitHub(activeKeys);
+}
+
+async function removeKeyFromGitHub(removedKey) {
+  const activeKeys = (await getAllActiveKeysFromMemory()).filter(k => k !== removedKey);
+  await pushKeysToGitHub(activeKeys);
+}
+
+// ─── KEY EXPIRY CHECKER ───────────────────────────────────────────────────────
+setInterval(async () => {
+  const now = Date.now();
+  for (const [userId, keys] of userKeys.entries()) {
+    for (const k of keys) {
+      if (!k.notified && k.expiresAt <= now) {
+        k.notified = true;
+        try {
+          const user = await client.users.fetch(userId);
+          await user.send(
+            `⏰ Your key has expired!\n\`\`\`${k.key}\`\`\`\nYou can generate a new one from the server.`
+          );
+        } catch {}
+        await removeKeyFromGitHub(k.key).catch(() => {});
+      }
+    }
+    // temizle
+    userKeys.set(userId, keys.filter(k => k.expiresAt > now || !k.notified));
+  }
+}, 60 * 1000); // her dakika kontrol
 
 // ─── AUTO ROLE + JOIN LOG ─────────────────────────────────────────────────────
 client.on('guildMemberAdd', async (member) => {
   try {
     const role = member.guild.roles.cache.get(AUTO_ROLE_ID);
-    if (role) await member.roles.add(role);
+    if (!role) return console.log('[AutoRole] Role not found.');
+    await member.roles.add(role);
   } catch (err) {
     console.error('[AutoRole] Error:', err);
   }
@@ -84,19 +182,11 @@ client.on('guildMemberRemove', async (member) => {
 client.on('messageCreate', async (message) => {
   if (message.author.bot) return;
 
-  const args = message.content.trim().split(/ +/);
-  const command = args[0].toLowerCase();
-
-  // ── !ping ──────────────────────────────────────────────────────────────────
-  if (command === '!ping') {
-    const sent = await message.reply('Pinging...');
-    sent.edit(`Pong! \`${sent.createdTimestamp - message.createdTimestamp}ms\``);
-  }
-
-  // ── !getmember ─────────────────────────────────────────────────────────────
-  if (command === '!getmember') {
-    if (!message.member.permissions.has(PermissionFlagsBits.ManageRoles))
+  // !getmember
+  if (message.content === '!getmember') {
+    if (!message.member.permissions.has(PermissionFlagsBits.ManageRoles)) {
       return message.reply('You do not have permission to use this command.');
+    }
 
     const embed = new EmbedBuilder()
       .setColor(0x5865F2)
@@ -110,319 +200,103 @@ client.on('messageCreate', async (message) => {
       );
 
     const row = new ActionRowBuilder().addComponents(
-      new ButtonBuilder().setCustomId('get_member').setLabel('Get Member').setStyle(ButtonStyle.Primary)
+      new ButtonBuilder()
+        .setCustomId('get_member')
+        .setLabel('Get Member')
+        .setStyle(ButtonStyle.Primary)
     );
 
     await message.channel.send({ embeds: [embed], components: [row] });
     await message.delete().catch(() => {});
   }
 
-  // ── !joins ─────────────────────────────────────────────────────────────────
-  if (command === '!joins') {
-    if (!message.member.permissions.has(PermissionFlagsBits.ManageGuild))
+  // !joins
+  if (message.content === '!joins') {
+    if (!message.member.permissions.has(PermissionFlagsBits.ManageGuild)) {
       return message.reply('You do not have permission to use this command.');
+    }
 
     joinLogChannelId = message.channel.id;
     await message.reply(`Join/Leave logs will now be sent to: <#${message.channel.id}>`);
     await message.delete().catch(() => {});
   }
 
-  // ── !ban @ [reason] ────────────────────────────────────────────────────────
-  if (command === '!ban') {
-    if (!message.member.permissions.has(PermissionFlagsBits.BanMembers))
+  // !keypanel
+  if (message.content === '!keypanel') {
+    if (!message.member.permissions.has(PermissionFlagsBits.ManageGuild)) {
       return message.reply('You do not have permission to use this command.');
-
-    const target = message.mentions.members.first();
-    if (!target) return message.reply('Please mention a valid member.');
-    if (!target.bannable) return message.reply('I cannot ban this user.');
-
-    const reason = args.slice(2).join(' ') || 'No reason provided';
-    await target.ban({ reason });
-    message.reply(`**${target.user.tag}** has been banned. Reason: ${reason}`);
-
-    sendLog(message.guild, modEmbed(0xED4245, 'Member Banned', [
-      { name: 'User', value: `${target.user.tag} (${target.id})`, inline: true },
-      { name: 'Moderator', value: message.author.tag, inline: true },
-      { name: 'Reason', value: reason },
-    ]));
-  }
-
-  // ── !unban ID ──────────────────────────────────────────────────────────────
-  if (command === '!unban') {
-    if (!message.member.permissions.has(PermissionFlagsBits.BanMembers))
-      return message.reply('You do not have permission to use this command.');
-
-    const userId = args[1];
-    if (!userId) return message.reply('Please provide a user ID.');
-
-    try {
-      const user = await client.users.fetch(userId);
-      await message.guild.members.unban(userId);
-      message.reply(`**${user.tag}** has been unbanned.`);
-
-      sendLog(message.guild, modEmbed(0x57F287, 'Member Unbanned', [
-        { name: 'User', value: `${user.tag} (${user.id})`, inline: true },
-        { name: 'Moderator', value: message.author.tag, inline: true },
-      ]));
-    } catch {
-      message.reply('Could not find a banned user with that ID.');
     }
+
+    const embed = new EmbedBuilder()
+      .setColor(0x9B59B6)
+      .setTitle('🔑 Key System')
+      .setDescription(
+        'Select a script below to generate a key.\n\n' +
+        'Each user has a maximum of **10 keys** per category.'
+      );
+
+    const row = new ActionRowBuilder().addComponents(
+      new ButtonBuilder()
+        .setCustomId('key_universal')
+        .setLabel('Universal')
+        .setStyle(ButtonStyle.Secondary)
+        .setEmoji('🌙')
+    );
+
+    await message.channel.send({ embeds: [embed], components: [row] });
+    await message.delete().catch(() => {});
   }
 
-  // ── !kick @ [reason] ───────────────────────────────────────────────────────
-  if (command === '!kick') {
-    if (!message.member.permissions.has(PermissionFlagsBits.KickMembers))
-      return message.reply('You do not have permission to use this command.');
-
-    const target = message.mentions.members.first();
-    if (!target) return message.reply('Please mention a valid member.');
-    if (!target.kickable) return message.reply('I cannot kick this user.');
-
-    const reason = args.slice(2).join(' ') || 'No reason provided';
-    await target.kick(reason);
-    message.reply(`**${target.user.tag}** has been kicked. Reason: ${reason}`);
-
-    sendLog(message.guild, modEmbed(0xFEE75C, 'Member Kicked', [
-      { name: 'User', value: `${target.user.tag} (${target.id})`, inline: true },
-      { name: 'Moderator', value: message.author.tag, inline: true },
-      { name: 'Reason', value: reason },
-    ]));
-  }
-
-  // ── !timeout @ [time] [reason] ─────────────────────────────────────────────
-  if (command === '!timeout') {
-    if (!message.member.permissions.has(PermissionFlagsBits.ModerateMembers))
-      return message.reply('You do not have permission to use this command.');
-
-    const target = message.mentions.members.first();
-    if (!target) return message.reply('Please mention a valid member.');
-
-    const timeStr = args[2];
-    if (!timeStr) return message.reply('Please provide a duration. Example: `10s`, `5m`, `1h`, `1d`');
-
-    const units = { s: 1000, m: 60000, h: 3600000, d: 86400000 };
-    const unit = timeStr.slice(-1);
-    const amount = parseInt(timeStr);
-    if (!units[unit] || isNaN(amount)) return message.reply('Invalid duration. Use: `10s`, `5m`, `1h`, `1d`');
-
-    const ms = amount * units[unit];
-    const reason = args.slice(3).join(' ') || 'No reason provided';
-
-    try {
-      await target.timeout(ms, reason);
-      message.reply(`**${target.user.tag}** has been timed out for **${timeStr}**. Reason: ${reason}`);
-
-      sendLog(message.guild, modEmbed(0xFFA500, 'Member Timed Out', [
-        { name: 'User', value: `${target.user.tag} (${target.id})`, inline: true },
-        { name: 'Moderator', value: message.author.tag, inline: true },
-        { name: 'Duration', value: timeStr, inline: true },
-        { name: 'Reason', value: reason },
-      ]));
-    } catch {
-      message.reply('Failed to timeout this user.');
+  // !mykey
+  if (message.content === '!mykey') {
+    const active = getActiveKeys(message.author.id);
+    if (active.length === 0) {
+      return message.author.send('❌ You have no active keys.').catch(() => {});
     }
-  }
 
-  // ── !del [amount] ──────────────────────────────────────────────────────────
-  if (command === '!del') {
-    if (!message.member.permissions.has(PermissionFlagsBits.ManageMessages))
-      return message.reply('You do not have permission to use this command.');
+    const now = Date.now();
+    const keyList = active.map(k => {
+      const remaining = Math.ceil((k.expiresAt - now) / 1000 / 60);
+      return `\`${k.key}\` — ⏳ ${remaining} min left`;
+    }).join('\n');
 
-    const amount = parseInt(args[1]);
-    if (isNaN(amount) || amount < 1 || amount > 100)
-      return message.reply('Please provide a number between 1 and 100.');
-
-    await message.channel.bulkDelete(amount + 1, true).catch(() => {
-      message.reply('Could not delete messages. Messages older than 14 days cannot be bulk deleted.');
+    await message.author.send(`🔑 **Your Active Keys:**\n\n${keyList}`).catch(() => {
+      message.reply('I could not DM you. Please enable DMs.');
     });
-
-    sendLog(message.guild, modEmbed(0x99AAB5, 'Messages Deleted', [
-      { name: 'Channel', value: `<#${message.channel.id}>`, inline: true },
-      { name: 'Amount', value: `${amount}`, inline: true },
-      { name: 'Moderator', value: message.author.tag, inline: true },
-    ]));
   }
 
-  // ── !whois @ ───────────────────────────────────────────────────────────────
-  if (command === '!whois') {
-    const target = message.mentions.members.first() || message.member;
-
-    const roles = target.roles.cache
-      .filter(r => r.id !== message.guild.id)
-      .sort((a, b) => b.position - a.position)
-      .map(r => `<@&${r.id}>`)
-      .join(', ') || 'None';
-
+  // !cmd
+  if (message.content === '!cmd') {
     const embed = new EmbedBuilder()
-      .setColor(0x5865F2)
-      .setAuthor({ name: target.user.tag, iconURL: target.user.displayAvatarURL({ dynamic: true }) })
-      .setThumbnail(target.user.displayAvatarURL({ dynamic: true, size: 256 }))
-      .addFields(
-        { name: 'Username', value: target.user.tag, inline: true },
-        { name: 'ID', value: target.id, inline: true },
-        { name: 'Nickname', value: target.nickname || 'None', inline: true },
-        { name: 'Account Created', value: `<t:${Math.floor(target.user.createdTimestamp / 1000)}:R>`, inline: true },
-        { name: 'Joined Server', value: `<t:${Math.floor(target.joinedTimestamp / 1000)}:R>`, inline: true },
-        { name: `Roles (${target.roles.cache.size - 1})`, value: roles },
-      )
-      .setTimestamp();
-
-    message.reply({ embeds: [embed] });
-  }
-
-  // ── !say #channel message ──────────────────────────────────────────────────
-  if (command === '!say') {
-    if (!message.member.permissions.has(PermissionFlagsBits.ManageMessages))
-      return message.reply('You do not have permission to use this command.');
-
-    const targetChannel = message.mentions.channels.first();
-    if (!targetChannel) return message.reply('Please mention a channel. Example: `!say #general Hello!`');
-
-    const content = args.slice(2).join(' ');
-    if (!content) return message.reply('Please provide a message to send.');
-
-    await targetChannel.send(content);
-    await message.delete().catch(() => {});
-  }
-
-  // ── .shelp ─────────────────────────────────────────────────────────────────
-  if (command === '.shelp') {
-    if (!message.member.roles.cache.has(SHELP_ROLE_ID))
-      return message.reply('You do not have permission to use this command.');
-
-    const embed = new EmbedBuilder()
-      .setColor(0x5865F2)
-      .setTitle('Staff Help — Command List')
-      .addFields(
-        { name: 'Moderation', value: '`!ban @user [reason]`\n`!unban <id>`\n`!kick @user [reason]`\n`!timeout @user <10s/5m/1h/1d> [reason]`\n`!del <1-100>`' },
-        { name: 'Info', value: '`!whois [@user]`\n`!ping`' },
-        { name: 'Utility', value: '`!say #channel <message>`\n`!getmember`\n`!joins`\n`!support`\n`!purchase`' },
-        { name: 'Staff Only', value: '`.shelp`' },
-      )
-      .setFooter({ text: 'AevumDevs Staff Panel' })
-      .setTimestamp();
-
-    message.reply({ embeds: [embed] });
-  }
-
-  // ── !support ───────────────────────────────────────────────────────────────
-  if (command === '!support') {
-    if (!message.member.permissions.has(PermissionFlagsBits.ManageChannels))
-      return message.reply('You do not have permission to use this command.');
-
-    const embed = new EmbedBuilder()
-      .setColor(0x5865F2)
-      .setTitle('AevumDevs | Support Ticket')
+      .setColor(0x3498DB)
+      .setTitle('📋 Commands')
       .setDescription(
-        'If you have any problems, you can open a Support Ticket.\n\n' +
-        '• Only staff and you can see the ticket.\n' +
-        '• Provide as much detail as possible.\n' +
-        '• Close the ticket when you are done.'
-      )
-      .setImage('https://cdn.discordapp.com/attachments/1492511561158365256/1492517573445812345/SupportTicket.gif?ex=69db9ecf&is=69da4d4f&hm=0cd856e9260e64cb9052fc821ce18ab006ce602a0677e54b21b354b56f4974ec&')
-      .setTimestamp();
-
-    const row = new ActionRowBuilder().addComponents(
-      new ButtonBuilder().setCustomId('open_support').setLabel('Support Ticket').setStyle(ButtonStyle.Primary)
-    );
-
-    await message.channel.send({ embeds: [embed], components: [row] });
-    await message.delete().catch(() => {});
-  }
-
-  // ── !purchase ──────────────────────────────────────────────────────────────
-  if (command === '!purchase') {
-    if (!message.member.permissions.has(PermissionFlagsBits.ManageChannels))
-      return message.reply('You do not have permission to use this command.');
-
-    const embed = new EmbedBuilder()
-      .setColor(0x5865F2)
-      .setTitle('AevumDevs | Purchase Ticket')
-      .setDescription(
-        'If you want to make a purchase, you can open a Purchase Ticket.\n\n' +
-        '• Only staff and you can see the ticket.\n' +
-        '• Provide as much detail as possible.\n' +
-        '• Close the ticket when you are done.'
-      )
-      .setImage('https://cdn.discordapp.com/attachments/1492511561158365256/1492520168616759346/PurchaseTicket.gif?ex=69dba139&is=69da4fb9&hm=ae25fbb2d8b5c3da07d2f9c67bea9ed9a6b16e2f06d4f3feb7530cd4134e94dd&')
-      .setTimestamp();
-
-    const row = new ActionRowBuilder().addComponents(
-      new ButtonBuilder().setCustomId('open_purchase').setLabel('Purchase Ticket').setStyle(ButtonStyle.Success)
-    );
-
-    await message.channel.send({ embeds: [embed], components: [row] });
-    await message.delete().catch(() => {});
-  }
-
-  // ── !close (ticket kanalında) ──────────────────────────────────────────────
-  if (command === '!close') {
-    if (!message.channel.name.startsWith('support-') && !message.channel.name.startsWith('purchase-')) return;
-
-    const hasPermission =
-      message.member.permissions.has(PermissionFlagsBits.ManageChannels) ||
-      message.member.roles.cache.has(SUPPORT_STAFF_ROLE);
-
-    if (!hasPermission) return message.reply('You do not have permission to close this ticket.');
-
-    await closeTicket(message.channel, message.guild, message.author);
+        '`!keypanel` — Show key panel (staff only)\n' +
+        '`!mykey` — View your active keys (DM)\n' +
+        '`!getmember` — Post member role button (staff only)\n' +
+        '`!joins` — Set join/leave log channel (staff only)'
+      );
+    await message.reply({ embeds: [embed] });
   }
 });
 
-// ─── CLOSE TICKET FUNCTION ────────────────────────────────────────────────────
-async function closeTicket(channel, guild, closedBy) {
-  try {
-    const messages = await channel.messages.fetch({ limit: 100 });
-    const sorted = [...messages.values()].reverse();
-
-    let transcript = `Ticket: ${channel.name}\nClosed by: ${closedBy.tag}\nDate: ${new Date().toISOString()}\n\n`;
-    transcript += '─'.repeat(50) + '\n\n';
-
-    for (const msg of sorted) {
-      const time = new Date(msg.createdTimestamp).toLocaleString('en-US');
-      transcript += `[${time}] ${msg.author.tag}: ${msg.content || '[embed/attachment]'}\n`;
-    }
-
-    const buffer = Buffer.from(transcript, 'utf-8');
-    const attachment = new AttachmentBuilder(buffer, { name: `${channel.name}.txt` });
-
-    const logChannel = guild.channels.cache.get(TICKET_LOG_CHANNEL);
-    if (logChannel) {
-      const logEmbed = new EmbedBuilder()
-        .setColor(0xED4245)
-        .setTitle('Ticket Closed')
-        .addFields(
-          { name: 'Ticket', value: channel.name, inline: true },
-          { name: 'Closed By', value: closedBy.tag, inline: true },
-        )
-        .setTimestamp();
-
-      await logChannel.send({ embeds: [logEmbed], files: [attachment] });
-    }
-
-    await channel.send('Ticket is being closed...');
-    setTimeout(() => channel.delete().catch(() => {}), 3000);
-  } catch (err) {
-    console.error('[CloseTicket] Error:', err);
-  }
-}
-
-// ─── BUTTONS ──────────────────────────────────────────────────────────────────
+// ─── INTERACTIONS ─────────────────────────────────────────────────────────────
 client.on('interactionCreate', async (interaction) => {
   if (!interaction.isButton()) return;
 
-  // ── get_member ─────────────────────────────────────────────────────────────
+  // get_member
   if (interaction.customId === 'get_member') {
     const role = interaction.guild.roles.cache.get(MEMBER_ROLE_ID);
-    if (!role)
+    if (!role) {
       return interaction.reply({ content: 'Member role not found. Contact an administrator.', ephemeral: true });
+    }
 
-    if (interaction.member.roles.cache.has(MEMBER_ROLE_ID))
+    if (interaction.member.roles.cache.has(MEMBER_ROLE_ID)) {
       return interaction.reply({ content: 'You already have the member role.', ephemeral: true });
+    }
 
     try {
       await interaction.member.roles.add(role);
-      await interaction.member.roles.remove(AUTO_ROLE_ID).catch(() => {});
       await interaction.reply({ content: 'Member role successfully assigned. Enjoy the server.', ephemeral: true });
     } catch (err) {
       console.error('[GetMember] Error:', err);
@@ -430,112 +304,50 @@ client.on('interactionCreate', async (interaction) => {
     }
   }
 
-  // ── open_support ───────────────────────────────────────────────────────────
-  if (interaction.customId === 'open_support') {
+  // key_universal
+  if (interaction.customId === 'key_universal') {
+    const member = interaction.member;
+    const hasRole = KEY_ROLE_IDS.some(id => member.roles.cache.has(id));
+
+    if (!hasRole) {
+      return interaction.reply({
+        content: '❌ You do not have the required role to generate a key.',
+        ephemeral: true,
+      });
+    }
+
+    const active = getActiveKeys(interaction.user.id);
+    if (active.length >= MAX_KEYS_PER_USER) {
+      return interaction.reply({
+        content: `❌ You already have **${MAX_KEYS_PER_USER}** active keys. Wait for one to expire.`,
+        ephemeral: true,
+      });
+    }
+
     await interaction.deferReply({ ephemeral: true });
 
-    ticketCounter++;
-    const channelName = `support-${interaction.user.username}-${ticketCounter}`;
+    const key = generateKey();
+    const expiresAt = Date.now() + KEY_DURATION_MS;
+
+    getUserKeys(interaction.user.id).push({ key, expiresAt, notified: false });
 
     try {
-      const ticketChannel = await interaction.guild.channels.create({
-        name: channelName,
-        type: ChannelType.GuildText,
-        parent: SUPPORT_CATEGORY_ID,
-        permissionOverwrites: [
-          {
-            id: interaction.guild.id,
-            deny: [PermissionFlagsBits.ViewChannel],
-          },
-          {
-            id: interaction.user.id,
-            allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory],
-          },
-          {
-            id: SUPPORT_STAFF_ROLE,
-            allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory],
-          },
-        ],
-      });
-
-      const embed = new EmbedBuilder()
-        .setColor(0x5865F2)
-        .setTitle('Support')
-        .setDescription(`${interaction.user.username}\n\nA staff member will be with you shortly.`)
-        .setThumbnail(interaction.user.displayAvatarURL({ dynamic: true, size: 128 }))
-        .setFooter({ text: `AevumDevs • ${new Date().toLocaleString('en-US', { month: 'numeric', day: 'numeric', year: 'numeric', hour: '2-digit', minute: '2-digit' })}` });
-
-      const row = new ActionRowBuilder().addComponents(
-        new ButtonBuilder().setCustomId('close_ticket').setLabel('Close').setStyle(ButtonStyle.Danger)
-      );
-
-      await ticketChannel.send({
-        content: `<@${interaction.user.id}> <@&${SUPPORT_STAFF_ROLE}>`,
-        embeds: [embed],
-        components: [row],
-      });
-
-      await interaction.editReply({ content: `Your ticket has been created: <#${ticketChannel.id}>` });
+      await addKeyToGitHub(key);
     } catch (err) {
-      console.error('[OpenSupport] Error:', err);
-      await interaction.editReply({ content: 'Failed to create ticket. Contact an administrator.' });
+      console.error('[GitHub] Push error:', err);
+      return interaction.editReply({ content: '❌ Failed to save key. Try again later.' });
     }
-  }
-
-  // ── open_purchase ──────────────────────────────────────────────────────────
-  if (interaction.customId === 'open_purchase') {
-    await interaction.deferReply({ ephemeral: true });
-
-    ticketCounter++;
-    const channelName = `purchase-${interaction.user.username}-${ticketCounter}`;
 
     try {
-      const ticketChannel = await interaction.guild.channels.create({
-        name: channelName,
-        type: ChannelType.GuildText,
-        parent: PURCHASE_CATEGORY_ID,
-        permissionOverwrites: [
-          { id: interaction.guild.id, deny: [PermissionFlagsBits.ViewChannel] },
-          { id: interaction.user.id, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory] },
-          { id: SUPPORT_STAFF_ROLE, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory] },
-        ],
-      });
-
-      const embed = new EmbedBuilder()
-        .setColor(0x57F287)
-        .setTitle('Purchase')
-        .setDescription(`${interaction.user.username}\n\nA staff member will be with you shortly.`)
-        .setThumbnail(interaction.user.displayAvatarURL({ dynamic: true, size: 128 }))
-        .setFooter({ text: `AevumDevs • ${new Date().toLocaleString('en-US', { month: 'numeric', day: 'numeric', year: 'numeric', hour: '2-digit', minute: '2-digit' })}` });
-
-      const row = new ActionRowBuilder().addComponents(
-        new ButtonBuilder().setCustomId('close_ticket').setLabel('Close').setStyle(ButtonStyle.Danger)
+      await interaction.user.send(
+        `✅ **Your Universal Key:**\n\`\`\`${key}\`\`\`\n⏳ Expires in **10 hours**.`
       );
-
-      await ticketChannel.send({
-        content: `<@${interaction.user.id}> <@&${SUPPORT_STAFF_ROLE}>`,
-        embeds: [embed],
-        components: [row],
+      await interaction.editReply({ content: '✅ Key sent to your DMs!' });
+    } catch {
+      await interaction.editReply({
+        content: `✅ Your key: \`${key}\`\n⏳ Expires in **10 hours**.\n\n⚠️ Enable DMs to receive future notifications.`,
       });
-
-      await interaction.editReply({ content: `Your ticket has been created: <#${ticketChannel.id}>` });
-    } catch (err) {
-      console.error('[OpenPurchase] Error:', err);
-      await interaction.editReply({ content: 'Failed to create ticket. Contact an administrator.' });
     }
-  }
-
-  // ── close_ticket (button) ──────────────────────────────────────────────────
-  if (interaction.customId === 'close_ticket') {
-    const hasPermission =
-      interaction.member.permissions.has(PermissionFlagsBits.ManageChannels) ||
-      interaction.member.roles.cache.has(SUPPORT_STAFF_ROLE);
-
-    if (!hasPermission)
-      return interaction.reply({ content: 'You do not have permission to close this ticket.', ephemeral: true });
-
-    await interaction.reply({ content: 'Closing ticket...', ephemeral: true });
-    await closeTicket(interaction.channel, interaction.guild, interaction.user);
   }
 });
 
