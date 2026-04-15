@@ -27,19 +27,38 @@ const KEY_DURATION_MS   = 10 * 60 * 60 * 1000;
 const MAX_KEYS_PER_USER = 10;
 
 const COLOR = {
-  white: 0xFFFFFF,
-  gray:  0x888888,
+  white:  0xFFFFFF,
+  gray:   0x888888,
+  red:    0xFF4444,
+  yellow: 0xFFCC00,
 };
 
-let joinLogChannelId = process.env.JOIN_LOG_CHANNEL_ID || '';
-let keyLogChannelId  = '';
+let joinLogChannelId  = process.env.JOIN_LOG_CHANNEL_ID || '';
+let keyLogChannelId   = '';
+let keyRightsChannelId = '';
 
 // userId -> [{ key, expiresAt, notified }]
 const userKeys = new Map();
 
+// userId -> extraSlots (granted by !ukey)
+const userKeySlots = new Map();
+
+// keyRights log: [{ grantedTo, grantedBy, slots, timestamp }]
+const keyRightsLog = [];
+
+function footer() {
+  return `AevumDevs  •  ${new Date().toLocaleString('en-US', { weekday: 'long', hour: '2-digit', minute: '2-digit' })}`;
+}
+
 async function sendKeyLog(embed) {
   if (!keyLogChannelId) return;
   const ch = client.channels.cache.get(keyLogChannelId);
+  if (ch) ch.send({ embeds: [embed] }).catch(() => {});
+}
+
+async function sendKeyRightsLog(embed) {
+  if (!keyRightsChannelId) return;
+  const ch = client.channels.cache.get(keyRightsChannelId);
   if (ch) ch.send({ embeds: [embed] }).catch(() => {});
 }
 
@@ -57,6 +76,10 @@ function getUserKeys(userId) {
 function getActiveKeys(userId) {
   const now = Date.now();
   return getUserKeys(userId).filter(k => k.expiresAt > now);
+}
+
+function getMaxKeys(userId) {
+  return MAX_KEYS_PER_USER + (userKeySlots.get(userId) || 0);
 }
 
 // ─── GITHUB ───────────────────────────────────────────────────────────────────
@@ -133,10 +156,11 @@ setInterval(async () => {
             .setColor(COLOR.gray)
             .setTitle('Key Expired')
             .addFields(
-              { name: 'Key',  value: `\`${k.key}\``, inline: false },
-              { name: 'User', value: `${user.tag} (${userId})`, inline: true },
-              { name: 'Expired At', value: new Date().toLocaleString('en-US'), inline: true }
-            );
+              { name: 'Key',        value: `\`${k.key}\``,                    inline: false },
+              { name: 'User',       value: `${user.tag} (${userId})`,          inline: true  },
+              { name: 'Expired At', value: new Date().toLocaleString('en-US'), inline: true  }
+            )
+            .setFooter({ text: footer() });
           await sendKeyLog(expireEmbed);
         } catch {}
       }
@@ -146,6 +170,16 @@ setInterval(async () => {
 
   if (changed) await pushKeysToGitHub().catch(() => {});
 }, 60 * 1000);
+
+// ─── PARSE DURATION ──────────────────────────────────────────────────────────
+function parseDuration(str) {
+  const match = str.match(/^(\d+)(s|m|h|d)$/);
+  if (!match) return null;
+  const n = parseInt(match[1]);
+  const unit = match[2];
+  const multipliers = { s: 1000, m: 60000, h: 3600000, d: 86400000 };
+  return n * multipliers[unit];
+}
 
 // ─── AUTO ROLE + JOIN LOG ─────────────────────────────────────────────────────
 client.on('guildMemberAdd', async (member) => {
@@ -167,7 +201,7 @@ client.on('guildMemberAdd', async (member) => {
     .setTitle('Welcome to AevumDevs')
     .setDescription(member.user.tag)
     .setThumbnail(member.user.displayAvatarURL({ dynamic: true, size: 128 }))
-    .setFooter({ text: `AevumDevs  •  ${new Date().toLocaleString('en-US', { weekday: 'long', hour: '2-digit', minute: '2-digit' })}` });
+    .setFooter({ text: footer() });
 
   logChannel.send({ embeds: [embed] });
 });
@@ -184,7 +218,7 @@ client.on('guildMemberRemove', async (member) => {
     .setTitle('See You Later')
     .setDescription(member.user.tag)
     .setThumbnail(member.user.displayAvatarURL({ dynamic: true, size: 128 }))
-    .setFooter({ text: `AevumDevs  •  ${new Date().toLocaleString('en-US', { weekday: 'long', hour: '2-digit', minute: '2-digit' })}` });
+    .setFooter({ text: footer() });
 
   logChannel.send({ embeds: [embed] });
 });
@@ -193,11 +227,431 @@ client.on('guildMemberRemove', async (member) => {
 client.on('messageCreate', async (message) => {
   if (message.author.bot) return;
 
-  // !getmember
-  if (message.content === '!getmember') {
-    if (!message.member.permissions.has(PermissionFlagsBits.ManageRoles)) {
+  const args    = message.content.trim().split(/\s+/);
+  const command = args[0].toLowerCase();
+
+  // ─── !ban ────────────────────────────────────────────────────────────────
+  if (command === '!ban') {
+    if (!message.member.permissions.has(PermissionFlagsBits.BanMembers))
       return message.reply('You do not have permission to use this command.');
+
+    const target = message.mentions.members.first();
+    if (!target) return message.reply('Please mention a valid member.');
+    const reason = args.slice(2).join(' ') || 'No reason provided.';
+
+    try {
+      await target.send(
+        `You have been **banned** from **${message.guild.name}**.\nReason: ${reason}`
+      ).catch(() => {});
+      await target.ban({ reason });
+
+      const embed = new EmbedBuilder()
+        .setColor(COLOR.red)
+        .setTitle('Member Banned')
+        .addFields(
+          { name: 'User',   value: `${target.user.tag} (${target.id})`, inline: true },
+          { name: 'Mod',    value: `${message.author.tag}`,              inline: true },
+          { name: 'Reason', value: reason,                               inline: false }
+        )
+        .setFooter({ text: footer() });
+
+      await message.channel.send({ embeds: [embed] });
+      await message.delete().catch(() => {});
+    } catch (err) {
+      message.reply(`Failed to ban: ${err.message}`);
     }
+  }
+
+  // ─── !unban ──────────────────────────────────────────────────────────────
+  if (command === '!unban') {
+    if (!message.member.permissions.has(PermissionFlagsBits.BanMembers))
+      return message.reply('You do not have permission to use this command.');
+
+    const userId = args[1];
+    if (!userId) return message.reply('Please provide a user ID.');
+
+    try {
+      const banned = await message.guild.bans.fetch(userId).catch(() => null);
+      if (!banned) return message.reply('That user is not banned.');
+
+      await message.guild.members.unban(userId);
+
+      const embed = new EmbedBuilder()
+        .setColor(COLOR.white)
+        .setTitle('Member Unbanned')
+        .addFields(
+          { name: 'User ID', value: userId,              inline: true },
+          { name: 'Mod',     value: message.author.tag,  inline: true }
+        )
+        .setFooter({ text: footer() });
+
+      await message.channel.send({ embeds: [embed] });
+      await message.delete().catch(() => {});
+    } catch (err) {
+      message.reply(`Failed to unban: ${err.message}`);
+    }
+  }
+
+  // ─── !kick ───────────────────────────────────────────────────────────────
+  if (command === '!kick') {
+    if (!message.member.permissions.has(PermissionFlagsBits.KickMembers))
+      return message.reply('You do not have permission to use this command.');
+
+    const target = message.mentions.members.first();
+    if (!target) return message.reply('Please mention a valid member.');
+    const reason = args.slice(2).join(' ') || 'No reason provided.';
+
+    try {
+      await target.send(
+        `You have been **kicked** from **${message.guild.name}**.\nReason: ${reason}`
+      ).catch(() => {});
+      await target.kick(reason);
+
+      const embed = new EmbedBuilder()
+        .setColor(COLOR.yellow)
+        .setTitle('Member Kicked')
+        .addFields(
+          { name: 'User',   value: `${target.user.tag} (${target.id})`, inline: true },
+          { name: 'Mod',    value: `${message.author.tag}`,              inline: true },
+          { name: 'Reason', value: reason,                               inline: false }
+        )
+        .setFooter({ text: footer() });
+
+      await message.channel.send({ embeds: [embed] });
+      await message.delete().catch(() => {});
+    } catch (err) {
+      message.reply(`Failed to kick: ${err.message}`);
+    }
+  }
+
+  // ─── !timeout <duration> @user ───────────────────────────────────────────
+  if (command === '!timeout') {
+    if (!message.member.permissions.has(PermissionFlagsBits.ModerateMembers))
+      return message.reply('You do not have permission to use this command.');
+
+    const durationStr = args[1];
+    const target      = message.mentions.members.first();
+
+    if (!durationStr || !target)
+      return message.reply('Usage: `!timeout <duration> @user`  (e.g. `!timeout 10m @user`)');
+
+    const ms = parseDuration(durationStr);
+    if (!ms) return message.reply('Invalid duration. Use format: `10s`, `5m`, `2h`, `1d`.');
+
+    try {
+      await target.timeout(ms);
+
+      await target.send(
+        `You have been **timed out** in **${message.guild.name}** for **${durationStr}**.`
+      ).catch(() => {});
+
+      const embed = new EmbedBuilder()
+        .setColor(COLOR.yellow)
+        .setTitle('Member Timed Out')
+        .addFields(
+          { name: 'User',     value: `${target.user.tag} (${target.id})`, inline: true  },
+          { name: 'Mod',      value: `${message.author.tag}`,              inline: true  },
+          { name: 'Duration', value: durationStr,                          inline: false }
+        )
+        .setFooter({ text: footer() });
+
+      await message.channel.send({ embeds: [embed] });
+      await message.delete().catch(() => {});
+    } catch (err) {
+      message.reply(`Failed to timeout: ${err.message}`);
+    }
+  }
+
+  // ─── !untimeout @user ─────────────────────────────────────────────────────
+  if (command === '!untimeout') {
+    if (!message.member.permissions.has(PermissionFlagsBits.ModerateMembers))
+      return message.reply('You do not have permission to use this command.');
+
+    const target = message.mentions.members.first();
+    if (!target) return message.reply('Please mention a valid member.');
+
+    try {
+      await target.timeout(null);
+
+      await target.send(
+        `Your timeout in **${message.guild.name}** has been removed.`
+      ).catch(() => {});
+
+      const embed = new EmbedBuilder()
+        .setColor(COLOR.white)
+        .setTitle('Timeout Removed')
+        .addFields(
+          { name: 'User', value: `${target.user.tag} (${target.id})`, inline: true },
+          { name: 'Mod',  value: `${message.author.tag}`,              inline: true }
+        )
+        .setFooter({ text: footer() });
+
+      await message.channel.send({ embeds: [embed] });
+      await message.delete().catch(() => {});
+    } catch (err) {
+      message.reply(`Failed to remove timeout: ${err.message}`);
+    }
+  }
+
+  // ─── !del <amount> ────────────────────────────────────────────────────────
+  if (command === '!del') {
+    if (!message.member.permissions.has(PermissionFlagsBits.ManageMessages))
+      return message.reply('You do not have permission to use this command.');
+
+    const amount = parseInt(args[1]);
+    if (isNaN(amount) || amount < 1 || amount > 100)
+      return message.reply('Please provide a number between 1 and 100.');
+
+    try {
+      await message.delete().catch(() => {});
+      const deleted = await message.channel.bulkDelete(amount, true);
+
+      const confirm = await message.channel.send(
+        `Deleted **${deleted.size}** message(s).`
+      );
+      setTimeout(() => confirm.delete().catch(() => {}), 4000);
+    } catch (err) {
+      message.channel.send(`Failed to delete messages: ${err.message}`);
+    }
+  }
+
+  // ─── !userinfo @user ──────────────────────────────────────────────────────
+  if (command === '!userinfo') {
+    const target = message.mentions.members.first() || message.member;
+    const user   = target.user;
+
+    const roles = target.roles.cache
+      .filter(r => r.id !== message.guild.id)
+      .map(r => `<@&${r.id}>`)
+      .join(', ') || 'None';
+
+    const embed = new EmbedBuilder()
+      .setColor(COLOR.white)
+      .setTitle('User Info')
+      .setThumbnail(user.displayAvatarURL({ dynamic: true, size: 128 }))
+      .addFields(
+        { name: 'Username',   value: user.tag,                                               inline: true  },
+        { name: 'ID',         value: user.id,                                                inline: true  },
+        { name: 'Nickname',   value: target.nickname || 'None',                              inline: true  },
+        { name: 'Joined Server', value: `<t:${Math.floor(target.joinedTimestamp / 1000)}:R>`, inline: true  },
+        { name: 'Joined Discord', value: `<t:${Math.floor(user.createdTimestamp / 1000)}:R>`, inline: true  },
+        { name: 'Roles',      value: roles,                                                  inline: false }
+      )
+      .setFooter({ text: footer() });
+
+    await message.reply({ embeds: [embed] });
+  }
+
+  // ─── !serverinfo ──────────────────────────────────────────────────────────
+  if (command === '!serverinfo') {
+    const guild = message.guild;
+    await guild.members.fetch().catch(() => {});
+
+    const totalMembers  = guild.memberCount;
+    const humanMembers  = guild.members.cache.filter(m => !m.user.bot).size;
+    const botMembers    = guild.members.cache.filter(m => m.user.bot).size;
+    const textChannels  = guild.channels.cache.filter(c => c.type === 0).size;
+    const voiceChannels = guild.channels.cache.filter(c => c.type === 2).size;
+    const roleCount     = guild.roles.cache.size - 1;
+
+    const embed = new EmbedBuilder()
+      .setColor(COLOR.white)
+      .setTitle('Server Info')
+      .setThumbnail(guild.iconURL({ dynamic: true, size: 128 }))
+      .addFields(
+        { name: 'Server',        value: guild.name,                                         inline: true  },
+        { name: 'Owner',         value: `<@${guild.ownerId}>`,                              inline: true  },
+        { name: 'Created',       value: `<t:${Math.floor(guild.createdTimestamp / 1000)}:R>`, inline: true },
+        { name: 'Members',       value: `${totalMembers} (${humanMembers} users, ${botMembers} bots)`, inline: false },
+        { name: 'Channels',      value: `${textChannels} text / ${voiceChannels} voice`,    inline: true  },
+        { name: 'Roles',         value: `${roleCount}`,                                     inline: true  },
+        { name: 'Boost Level',   value: `${guild.premiumTier}`,                             inline: true  },
+        { name: 'Boosts',        value: `${guild.premiumSubscriptionCount}`,                inline: true  }
+      )
+      .setFooter({ text: footer() });
+
+    await message.reply({ embeds: [embed] });
+  }
+
+  // ─── !ukey <amount> @user ────────────────────────────────────────────────
+  if (command === '!ukey') {
+    if (!message.member.permissions.has(PermissionFlagsBits.ManageGuild))
+      return message.reply('You do not have permission to use this command.');
+
+    const amount = parseInt(args[1]);
+    const target = message.mentions.members.first();
+
+    if (isNaN(amount) || amount < 1 || !target)
+      return message.reply('Usage: `!ukey <amount> @user`');
+
+    const prev = userKeySlots.get(target.id) || 0;
+    userKeySlots.set(target.id, prev + amount);
+
+    keyRightsLog.push({
+      grantedTo:  target.id,
+      grantedBy:  message.author.id,
+      slots:      amount,
+      timestamp:  Date.now(),
+    });
+
+    const embed = new EmbedBuilder()
+      .setColor(COLOR.white)
+      .setTitle('Key Rights Granted')
+      .addFields(
+        { name: 'Granted To', value: `${target.user.tag} (${target.id})`,    inline: true  },
+        { name: 'Granted By', value: `${message.author.tag}`,                 inline: true  },
+        { name: 'Slots Added', value: `${amount}`,                            inline: true  },
+        { name: 'Total Slots', value: `${getMaxKeys(target.id)}`,             inline: true  }
+      )
+      .setFooter({ text: footer() });
+
+    await sendKeyRightsLog(embed);
+
+    // DM both parties
+    await target.send(
+      `You have been granted **${amount}** additional key slot(s) by **${message.author.tag}**.\nYou can now generate up to **${getMaxKeys(target.id)}** keys.`
+    ).catch(() => {});
+
+    await message.reply({ embeds: [embed] });
+    await message.delete().catch(() => {});
+  }
+
+  // ─── !keyrights ───────────────────────────────────────────────────────────
+  if (command === '!keyrights') {
+    if (!message.member.permissions.has(PermissionFlagsBits.ManageGuild))
+      return message.reply('You do not have permission to use this command.');
+
+    keyRightsChannelId = message.channel.id;
+
+    if (keyRightsLog.length === 0) {
+      await message.reply(`Key rights log channel set to <#${message.channel.id}>. No entries yet.`);
+      await message.delete().catch(() => {});
+      return;
+    }
+
+    const lines = keyRightsLog.map(e => {
+      const ts = `<t:${Math.floor(e.timestamp / 1000)}:R>`;
+      return `<@${e.grantedTo}> — **+${e.slots}** slots — by <@${e.grantedBy}> — ${ts}`;
+    }).join('\n');
+
+    const embed = new EmbedBuilder()
+      .setColor(COLOR.white)
+      .setTitle('Key Rights Log')
+      .setDescription(lines.length > 4096 ? lines.slice(0, 4090) + '...' : lines)
+      .setFooter({ text: footer() });
+
+    await message.channel.send({ embeds: [embed] });
+    await message.delete().catch(() => {});
+  }
+
+  // ─── !delallkey @user ─────────────────────────────────────────────────────
+  if (command === '!delallkey') {
+    if (!message.member.permissions.has(PermissionFlagsBits.ManageGuild))
+      return message.reply('You do not have permission to use this command.');
+
+    const target = message.mentions.members.first();
+    if (!target) return message.reply('Please mention a valid member.');
+
+    const keys = getUserKeys(target.id);
+    const count = keys.length;
+    userKeys.set(target.id, []);
+
+    await pushKeysToGitHub().catch(() => {});
+
+    const embed = new EmbedBuilder()
+      .setColor(COLOR.red)
+      .setTitle('All Keys Deleted')
+      .addFields(
+        { name: 'User',    value: `${target.user.tag} (${target.id})`, inline: true },
+        { name: 'Deleted', value: `${count} key(s)`,                   inline: true },
+        { name: 'Mod',     value: `${message.author.tag}`,              inline: true }
+      )
+      .setFooter({ text: footer() });
+
+    await sendKeyLog(embed);
+    await message.reply({ embeds: [embed] });
+    await message.delete().catch(() => {});
+  }
+
+  // ─── !delkey <KEY> ────────────────────────────────────────────────────────
+  if (command === '!delkey') {
+    if (!message.member.permissions.has(PermissionFlagsBits.ManageGuild))
+      return message.reply('You do not have permission to use this command.');
+
+    const keyArg = args[1];
+    if (!keyArg) return message.reply('Usage: `!delkey <KEY>`');
+
+    let found = false;
+    let ownerTag = 'Unknown';
+
+    for (const [userId, keys] of userKeys.entries()) {
+      const idx = keys.findIndex(k => k.key === keyArg);
+      if (idx !== -1) {
+        keys.splice(idx, 1);
+        found = true;
+        try {
+          const u = await client.users.fetch(userId);
+          ownerTag = u.tag;
+        } catch {}
+        break;
+      }
+    }
+
+    if (!found) return message.reply('Key not found.');
+
+    await pushKeysToGitHub().catch(() => {});
+
+    const embed = new EmbedBuilder()
+      .setColor(COLOR.red)
+      .setTitle('Key Deleted')
+      .addFields(
+        { name: 'Key',   value: `\`${keyArg}\``,   inline: false },
+        { name: 'Owner', value: ownerTag,            inline: true  },
+        { name: 'Mod',   value: message.author.tag,  inline: true  }
+      )
+      .setFooter({ text: footer() });
+
+    await sendKeyLog(embed);
+    await message.reply({ embeds: [embed] });
+    await message.delete().catch(() => {});
+  }
+
+  // ─── !ping ────────────────────────────────────────────────────────────────
+  if (command === '!ping') {
+    const sent = await message.reply('Pinging...');
+    const latency = sent.createdTimestamp - message.createdTimestamp;
+    const wsLatency = client.ws.ping;
+
+    const embed = new EmbedBuilder()
+      .setColor(COLOR.white)
+      .setTitle('Pong')
+      .addFields(
+        { name: 'Roundtrip', value: `${latency}ms`,   inline: true },
+        { name: 'WebSocket', value: `${wsLatency}ms`, inline: true }
+      )
+      .setFooter({ text: footer() });
+
+    await sent.edit({ content: null, embeds: [embed] });
+  }
+
+  // ─── !avatar @user ────────────────────────────────────────────────────────
+  if (command === '!avatar') {
+    const target = message.mentions.users.first() || message.author;
+    const url    = target.displayAvatarURL({ dynamic: true, size: 1024 });
+
+    const embed = new EmbedBuilder()
+      .setColor(COLOR.white)
+      .setTitle(`${target.username}'s Avatar`)
+      .setImage(url)
+      .setFooter({ text: footer() });
+
+    await message.reply({ embeds: [embed] });
+  }
+
+  // ─── !getmember ───────────────────────────────────────────────────────────
+  if (command === '!getmember') {
+    if (!message.member.permissions.has(PermissionFlagsBits.ManageRoles))
+      return message.reply('You do not have permission to use this command.');
 
     const embed = new EmbedBuilder()
       .setColor(COLOR.white)
@@ -221,32 +675,32 @@ client.on('messageCreate', async (message) => {
     await message.delete().catch(() => {});
   }
 
-  // !joins
-  if (message.content === '!joins') {
-    if (!message.member.permissions.has(PermissionFlagsBits.ManageGuild)) {
+  // ─── !joins ───────────────────────────────────────────────────────────────
+  if (command === '!joins') {
+    if (!message.member.permissions.has(PermissionFlagsBits.ManageGuild))
       return message.reply('You do not have permission to use this command.');
-    }
 
     joinLogChannelId = message.channel.id;
-    await message.reply(`Join/Leave logs will now be sent to: <#${message.channel.id}>`);
+    const reply = await message.reply(`Join/Leave logs will now be sent to: <#${message.channel.id}>`);
     await message.delete().catch(() => {});
+    setTimeout(() => reply.delete().catch(() => {}), 5000);
   }
 
-  // !keylog
-  if (message.content === '!keylog') {
-    if (!message.member.permissions.has(PermissionFlagsBits.ManageGuild)) {
+  // ─── !keylog ──────────────────────────────────────────────────────────────
+  if (command === '!keylog') {
+    if (!message.member.permissions.has(PermissionFlagsBits.ManageGuild))
       return message.reply('You do not have permission to use this command.');
-    }
+
     keyLogChannelId = message.channel.id;
-    await message.reply(`Key logs will now be sent to: <#${message.channel.id}>`);
+    const reply = await message.reply(`Key logs will now be sent to: <#${message.channel.id}>`);
     await message.delete().catch(() => {});
+    setTimeout(() => reply.delete().catch(() => {}), 5000);
   }
 
-  // !keypanel
-  if (message.content === '!keypanel') {
-    if (!message.member.permissions.has(PermissionFlagsBits.ManageGuild)) {
+  // ─── !keypanel ────────────────────────────────────────────────────────────
+  if (command === '!keypanel') {
+    if (!message.member.permissions.has(PermissionFlagsBits.ManageGuild))
       return message.reply('You do not have permission to use this command.');
-    }
 
     const embed = new EmbedBuilder()
       .setColor(COLOR.white)
@@ -267,8 +721,8 @@ client.on('messageCreate', async (message) => {
     await message.delete().catch(() => {});
   }
 
-  // !mykey
-  if (message.content === '!mykey') {
+  // ─── !mykey ───────────────────────────────────────────────────────────────
+  if (command === '!mykey') {
     const active = getActiveKeys(message.author.id);
     if (active.length === 0) {
       return message.author.send('You have no active keys.').catch(() => {
@@ -287,18 +741,54 @@ client.on('messageCreate', async (message) => {
     });
   }
 
-  // !cmd
-  if (message.content === '!cmd') {
+  // ─── !cmd ─────────────────────────────────────────────────────────────────
+  if (command === '!cmd') {
     const embed = new EmbedBuilder()
       .setColor(COLOR.white)
       .setTitle('Commands')
-      .setDescription(
-        '`!keypanel` — Post key panel  *(staff)*\n' +
-        '`!keylog` — Set key log channel  *(staff)*\n' +
-        '`!mykey` — View your active keys via DM\n' +
-        '`!getmember` — Post member role button  *(staff)*\n' +
-        '`!joins` — Set join/leave log channel  *(staff)*'
-      );
+      .addFields(
+        {
+          name: 'Moderation',
+          value:
+            '`!ban @user [reason]` — Ban a member\n' +
+            '`!unban <id>` — Unban a user by ID\n' +
+            '`!kick @user [reason]` — Kick a member\n' +
+            '`!timeout <duration> @user` — Timeout a member  (e.g. `10m`, `2h`)\n' +
+            '`!untimeout @user` — Remove timeout\n' +
+            '`!del <amount>` — Bulk delete messages (1-100)',
+          inline: false,
+        },
+        {
+          name: 'Info',
+          value:
+            '`!userinfo [@user]` — Show user info\n' +
+            '`!serverinfo` — Show server info\n' +
+            '`!avatar [@user]` — Show avatar\n' +
+            '`!ping` — Show bot latency',
+          inline: false,
+        },
+        {
+          name: 'Key System',
+          value:
+            '`!keypanel` — Post key panel  *(staff)*\n' +
+            '`!keylog` — Set key log channel  *(staff)*\n' +
+            '`!mykey` — View your active keys via DM\n' +
+            '`!ukey <amount> @user` — Grant key slots  *(staff)*\n' +
+            '`!keyrights` — Set key rights log channel & view log  *(staff)*\n' +
+            '`!delallkey @user` — Delete all keys of a user  *(staff)*\n' +
+            '`!delkey <KEY>` — Delete a specific key  *(staff)*',
+          inline: false,
+        },
+        {
+          name: 'Server',
+          value:
+            '`!getmember` — Post member role button  *(staff)*\n' +
+            '`!joins` — Set join/leave log channel  *(staff)*',
+          inline: false,
+        }
+      )
+      .setFooter({ text: footer() });
+
     await message.reply({ embeds: [embed] });
   }
 });
@@ -310,13 +800,11 @@ client.on('interactionCreate', async (interaction) => {
   // get_member
   if (interaction.customId === 'get_member') {
     const role = interaction.guild.roles.cache.get(MEMBER_ROLE_ID);
-    if (!role) {
+    if (!role)
       return interaction.reply({ content: 'Member role not found. Contact an administrator.', ephemeral: true });
-    }
 
-    if (interaction.member.roles.cache.has(MEMBER_ROLE_ID)) {
+    if (interaction.member.roles.cache.has(MEMBER_ROLE_ID))
       return interaction.reply({ content: 'You already have the member role.', ephemeral: true });
-    }
 
     try {
       await interaction.member.roles.add(role);
@@ -339,17 +827,19 @@ client.on('interactionCreate', async (interaction) => {
       });
     }
 
-    const active = getActiveKeys(interaction.user.id);
-    if (active.length >= MAX_KEYS_PER_USER) {
+    const active  = getActiveKeys(interaction.user.id);
+    const maxKeys = getMaxKeys(interaction.user.id);
+
+    if (active.length >= maxKeys) {
       return interaction.reply({
-        content: `You already have ${MAX_KEYS_PER_USER} active keys. Wait for one to expire.`,
+        content: `You already have ${maxKeys} active keys. Wait for one to expire.`,
         ephemeral: true,
       });
     }
 
     await interaction.deferReply({ ephemeral: true });
 
-    const key = generateKey();
+    const key       = generateKey();
     const expiresAt = Date.now() + KEY_DURATION_MS;
     getUserKeys(interaction.user.id).push({ key, expiresAt, notified: false });
 
@@ -365,12 +855,14 @@ client.on('interactionCreate', async (interaction) => {
       .setColor(COLOR.white)
       .setTitle('Key Generated')
       .addFields(
-        { name: 'Key',      value: `\`${key}\``, inline: false },
-        { name: 'Type',     value: 'Universal',  inline: true },
+        { name: 'Key',      value: `\`${key}\``,                                   inline: false },
+        { name: 'Type',     value: 'Universal',                                    inline: true  },
         { name: 'User',     value: `${interaction.user.tag} (${interaction.user.id})`, inline: true },
-        { name: 'Duration', value: '10 hours',   inline: true },
-        { name: 'Expires',  value: expiresDate,  inline: false }
-      );
+        { name: 'Duration', value: '10 hours',                                     inline: true  },
+        { name: 'Expires',  value: expiresDate,                                    inline: false }
+      )
+      .setFooter({ text: footer() });
+
     await sendKeyLog(genEmbed);
 
     try {
