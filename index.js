@@ -19,17 +19,29 @@ const AUTO_ROLE_ID   = process.env.AUTO_ROLE_ID;
 const MEMBER_ROLE_ID = process.env.MEMBER_ROLE_ID;
 const BOT_TOKEN      = process.env.BOT_TOKEN;
 const GITHUB_TOKEN   = process.env.GITHUB_TOKEN;
-const GITHUB_REPO    = process.env.GITHUB_REPO;   // Aevum0/AevumDevsKeySystem
-const GITHUB_FILE    = process.env.GITHUB_FILE_PATH; // UniversalKeySystem.txt
+const GITHUB_REPO    = process.env.GITHUB_REPO;
+const GITHUB_FILE    = process.env.GITHUB_FILE_PATH;
 
-const KEY_ROLE_IDS   = ['1491479203869098056', '1491478838390034635'];
-const KEY_DURATION_MS = 10 * 60 * 60 * 1000; // 10 saat
+const KEY_ROLE_IDS      = ['1491479203869098056', '1491478838390034635'];
+const KEY_DURATION_MS   = 10 * 60 * 60 * 1000;
 const MAX_KEYS_PER_USER = 10;
 
+const COLOR = {
+  white: 0xFFFFFF,
+  gray:  0x888888,
+};
+
 let joinLogChannelId = process.env.JOIN_LOG_CHANNEL_ID || '';
+let keyLogChannelId  = '';
 
 // userId -> [{ key, expiresAt, notified }]
 const userKeys = new Map();
+
+async function sendKeyLog(embed) {
+  if (!keyLogChannelId) return;
+  const ch = client.channels.cache.get(keyLogChannelId);
+  if (ch) ch.send({ embeds: [embed] }).catch(() => {});
+}
 
 // ─── KEY HELPERS ──────────────────────────────────────────────────────────────
 function generateKey() {
@@ -76,22 +88,7 @@ async function githubRequest(method, path, body) {
 
 async function getFileSha() {
   const res = await githubRequest('GET', `/repos/${GITHUB_REPO}/contents/${GITHUB_FILE}`);
-  return { sha: res.sha, content: res.content };
-}
-
-async function pushKeysToGitHub(keys) {
-  let sha;
-  try {
-    const file = await getFileSha();
-    sha = file.sha;
-  } catch {}
-
-  const content = Buffer.from(keys.join('\n') + '\n').toString('base64');
-  await githubRequest('PUT', `/repos/${GITHUB_REPO}/contents/${GITHUB_FILE}`, {
-    message: 'AevumBot: key update',
-    content,
-    ...(sha ? { sha } : {}),
-  });
+  return res.sha;
 }
 
 async function getAllActiveKeysFromMemory() {
@@ -105,36 +102,50 @@ async function getAllActiveKeysFromMemory() {
   return all;
 }
 
-async function addKeyToGitHub(newKey) {
-  const activeKeys = await getAllActiveKeysFromMemory();
-  await pushKeysToGitHub(activeKeys);
-}
-
-async function removeKeyFromGitHub(removedKey) {
-  const activeKeys = (await getAllActiveKeysFromMemory()).filter(k => k !== removedKey);
-  await pushKeysToGitHub(activeKeys);
+async function pushKeysToGitHub() {
+  const keys = await getAllActiveKeysFromMemory();
+  let sha;
+  try { sha = await getFileSha(); } catch {}
+  const content = Buffer.from(keys.join('\n') + '\n').toString('base64');
+  await githubRequest('PUT', `/repos/${GITHUB_REPO}/contents/${GITHUB_FILE}`, {
+    message: 'AevumBot: key update',
+    content,
+    ...(sha ? { sha } : {}),
+  });
 }
 
 // ─── KEY EXPIRY CHECKER ───────────────────────────────────────────────────────
 setInterval(async () => {
   const now = Date.now();
+  let changed = false;
+
   for (const [userId, keys] of userKeys.entries()) {
     for (const k of keys) {
       if (!k.notified && k.expiresAt <= now) {
         k.notified = true;
+        changed = true;
         try {
           const user = await client.users.fetch(userId);
           await user.send(
-            `⏰ Your key has expired!\n\`\`\`${k.key}\`\`\`\nYou can generate a new one from the server.`
+            `Your key has expired.\n\`\`\`${k.key}\`\`\`\nYou can generate a new one from the server.`
           );
+          const expireEmbed = new EmbedBuilder()
+            .setColor(COLOR.gray)
+            .setTitle('Key Expired')
+            .addFields(
+              { name: 'Key',  value: `\`${k.key}\``, inline: false },
+              { name: 'User', value: `${user.tag} (${userId})`, inline: true },
+              { name: 'Expired At', value: new Date().toLocaleString('en-US'), inline: true }
+            );
+          await sendKeyLog(expireEmbed);
         } catch {}
-        await removeKeyFromGitHub(k.key).catch(() => {});
       }
     }
-    // temizle
-    userKeys.set(userId, keys.filter(k => k.expiresAt > now || !k.notified));
+    userKeys.set(userId, keys.filter(k => k.expiresAt > now));
   }
-}, 60 * 1000); // her dakika kontrol
+
+  if (changed) await pushKeysToGitHub().catch(() => {});
+}, 60 * 1000);
 
 // ─── AUTO ROLE + JOIN LOG ─────────────────────────────────────────────────────
 client.on('guildMemberAdd', async (member) => {
@@ -151,12 +162,12 @@ client.on('guildMemberAdd', async (member) => {
   if (!logChannel) return;
 
   const embed = new EmbedBuilder()
-    .setColor(0x57F287)
+    .setColor(COLOR.white)
     .setAuthor({ name: member.user.tag, iconURL: member.user.displayAvatarURL({ dynamic: true }) })
     .setTitle('Welcome to AevumDevs')
     .setDescription(member.user.tag)
     .setThumbnail(member.user.displayAvatarURL({ dynamic: true, size: 128 }))
-    .setFooter({ text: `AevumDevs • ${new Date().toLocaleString('en-US', { weekday: 'long', hour: '2-digit', minute: '2-digit' })}` });
+    .setFooter({ text: `AevumDevs  •  ${new Date().toLocaleString('en-US', { weekday: 'long', hour: '2-digit', minute: '2-digit' })}` });
 
   logChannel.send({ embeds: [embed] });
 });
@@ -168,12 +179,12 @@ client.on('guildMemberRemove', async (member) => {
   if (!logChannel) return;
 
   const embed = new EmbedBuilder()
-    .setColor(0xED4245)
+    .setColor(COLOR.gray)
     .setAuthor({ name: member.user.tag, iconURL: member.user.displayAvatarURL({ dynamic: true }) })
     .setTitle('See You Later')
     .setDescription(member.user.tag)
     .setThumbnail(member.user.displayAvatarURL({ dynamic: true, size: 128 }))
-    .setFooter({ text: `AevumDevs • ${new Date().toLocaleString('en-US', { weekday: 'long', hour: '2-digit', minute: '2-digit' })}` });
+    .setFooter({ text: `AevumDevs  •  ${new Date().toLocaleString('en-US', { weekday: 'long', hour: '2-digit', minute: '2-digit' })}` });
 
   logChannel.send({ embeds: [embed] });
 });
@@ -189,7 +200,7 @@ client.on('messageCreate', async (message) => {
     }
 
     const embed = new EmbedBuilder()
-      .setColor(0x5865F2)
+      .setColor(COLOR.white)
       .setTitle('Get Member')
       .setDescription(
         '> To gain full access to the server, click the button below to receive the member role.\n' +
@@ -203,7 +214,7 @@ client.on('messageCreate', async (message) => {
       new ButtonBuilder()
         .setCustomId('get_member')
         .setLabel('Get Member')
-        .setStyle(ButtonStyle.Primary)
+        .setStyle(ButtonStyle.Secondary)
     );
 
     await message.channel.send({ embeds: [embed], components: [row] });
@@ -221,6 +232,16 @@ client.on('messageCreate', async (message) => {
     await message.delete().catch(() => {});
   }
 
+  // !keylog
+  if (message.content === '!keylog') {
+    if (!message.member.permissions.has(PermissionFlagsBits.ManageGuild)) {
+      return message.reply('You do not have permission to use this command.');
+    }
+    keyLogChannelId = message.channel.id;
+    await message.reply(`Key logs will now be sent to: <#${message.channel.id}>`);
+    await message.delete().catch(() => {});
+  }
+
   // !keypanel
   if (message.content === '!keypanel') {
     if (!message.member.permissions.has(PermissionFlagsBits.ManageGuild)) {
@@ -228,8 +249,8 @@ client.on('messageCreate', async (message) => {
     }
 
     const embed = new EmbedBuilder()
-      .setColor(0x9B59B6)
-      .setTitle('🔑 Key System')
+      .setColor(COLOR.white)
+      .setTitle('Key System')
       .setDescription(
         'Select a script below to generate a key.\n\n' +
         'Each user has a maximum of **10 keys** per category.'
@@ -240,7 +261,6 @@ client.on('messageCreate', async (message) => {
         .setCustomId('key_universal')
         .setLabel('Universal')
         .setStyle(ButtonStyle.Secondary)
-        .setEmoji('🌙')
     );
 
     await message.channel.send({ embeds: [embed], components: [row] });
@@ -251,30 +271,33 @@ client.on('messageCreate', async (message) => {
   if (message.content === '!mykey') {
     const active = getActiveKeys(message.author.id);
     if (active.length === 0) {
-      return message.author.send('❌ You have no active keys.').catch(() => {});
+      return message.author.send('You have no active keys.').catch(() => {
+        message.reply('You have no active keys.');
+      });
     }
 
     const now = Date.now();
     const keyList = active.map(k => {
       const remaining = Math.ceil((k.expiresAt - now) / 1000 / 60);
-      return `\`${k.key}\` — ⏳ ${remaining} min left`;
+      return `\`${k.key}\`  —  ${remaining} min remaining`;
     }).join('\n');
 
-    await message.author.send(`🔑 **Your Active Keys:**\n\n${keyList}`).catch(() => {
-      message.reply('I could not DM you. Please enable DMs.');
+    await message.author.send(`**Active Keys**\n\n${keyList}`).catch(() => {
+      message.reply('Could not DM you. Please enable DMs.');
     });
   }
 
   // !cmd
   if (message.content === '!cmd') {
     const embed = new EmbedBuilder()
-      .setColor(0x3498DB)
-      .setTitle('📋 Commands')
+      .setColor(COLOR.white)
+      .setTitle('Commands')
       .setDescription(
-        '`!keypanel` — Show key panel (staff only)\n' +
-        '`!mykey` — View your active keys (DM)\n' +
-        '`!getmember` — Post member role button (staff only)\n' +
-        '`!joins` — Set join/leave log channel (staff only)'
+        '`!keypanel` — Post key panel  *(staff)*\n' +
+        '`!keylog` — Set key log channel  *(staff)*\n' +
+        '`!mykey` — View your active keys via DM\n' +
+        '`!getmember` — Post member role button  *(staff)*\n' +
+        '`!joins` — Set join/leave log channel  *(staff)*'
       );
     await message.reply({ embeds: [embed] });
   }
@@ -297,7 +320,7 @@ client.on('interactionCreate', async (interaction) => {
 
     try {
       await interaction.member.roles.add(role);
-      await interaction.reply({ content: 'Member role successfully assigned. Enjoy the server.', ephemeral: true });
+      await interaction.reply({ content: 'Member role assigned. Enjoy the server.', ephemeral: true });
     } catch (err) {
       console.error('[GetMember] Error:', err);
       await interaction.reply({ content: 'Failed to assign role. Contact an administrator.', ephemeral: true });
@@ -311,7 +334,7 @@ client.on('interactionCreate', async (interaction) => {
 
     if (!hasRole) {
       return interaction.reply({
-        content: '❌ You do not have the required role to generate a key.',
+        content: 'You do not have the required role to generate a key.',
         ephemeral: true,
       });
     }
@@ -319,7 +342,7 @@ client.on('interactionCreate', async (interaction) => {
     const active = getActiveKeys(interaction.user.id);
     if (active.length >= MAX_KEYS_PER_USER) {
       return interaction.reply({
-        content: `❌ You already have **${MAX_KEYS_PER_USER}** active keys. Wait for one to expire.`,
+        content: `You already have ${MAX_KEYS_PER_USER} active keys. Wait for one to expire.`,
         ephemeral: true,
       });
     }
@@ -328,24 +351,36 @@ client.on('interactionCreate', async (interaction) => {
 
     const key = generateKey();
     const expiresAt = Date.now() + KEY_DURATION_MS;
-
     getUserKeys(interaction.user.id).push({ key, expiresAt, notified: false });
 
     try {
-      await addKeyToGitHub(key);
+      await pushKeysToGitHub();
     } catch (err) {
       console.error('[GitHub] Push error:', err);
-      return interaction.editReply({ content: '❌ Failed to save key. Try again later.' });
+      return interaction.editReply({ content: 'Failed to save key. Try again later.' });
     }
+
+    const expiresDate = new Date(expiresAt).toLocaleString('en-US');
+    const genEmbed = new EmbedBuilder()
+      .setColor(COLOR.white)
+      .setTitle('Key Generated')
+      .addFields(
+        { name: 'Key',      value: `\`${key}\``, inline: false },
+        { name: 'Type',     value: 'Universal',  inline: true },
+        { name: 'User',     value: `${interaction.user.tag} (${interaction.user.id})`, inline: true },
+        { name: 'Duration', value: '10 hours',   inline: true },
+        { name: 'Expires',  value: expiresDate,  inline: false }
+      );
+    await sendKeyLog(genEmbed);
 
     try {
       await interaction.user.send(
-        `✅ **Your Universal Key:**\n\`\`\`${key}\`\`\`\n⏳ Expires in **10 hours**.`
+        `**Universal Key**\n\`\`\`${key}\`\`\`Expires in **10 hours**.`
       );
-      await interaction.editReply({ content: '✅ Key sent to your DMs!' });
+      await interaction.editReply({ content: 'Key sent to your DMs.' });
     } catch {
       await interaction.editReply({
-        content: `✅ Your key: \`${key}\`\n⏳ Expires in **10 hours**.\n\n⚠️ Enable DMs to receive future notifications.`,
+        content: `**Your Key**\n\`\`\`${key}\`\`\`Expires in **10 hours**.\n\nEnable DMs to receive expiry notifications.`,
       });
     }
   }
